@@ -1,0 +1,90 @@
+# Baut die App auf einem Mac von GitHub, ohne Signatur. Ergebnis: Werkstatt-unsigniert.ipa als Download (Artifact).
+# Signiert wird erst am Laptop (z. B. Sideloadly mit der Zweit-Apple-ID), deshalb braucht dieser Ablauf keine Schlüssel.
+# Im Repo stehen nur Code und Einstellungen, keine Firmendaten und keine Zugangsdaten.
+name: iOS-Build (unsigniert)
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Mac-Image (SDK 58 baut Expo selbst mit Xcode 27)"
+        type: choice
+        default: xcode-27
+        options:
+          - xcode-27
+          - macos-26
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+
+concurrency:
+  group: ios-build
+  cancel-in-progress: true
+
+jobs:
+  ios:
+    runs-on: ${{ inputs.runner || 'xcode-27' }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Neuestes Xcode wählen
+        run: |
+          ls -d /Applications/Xcode*.app
+          XCODE=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+
+      - name: Pakete installieren
+        run: npm ci --no-audit --no-fund
+
+      - name: iOS-Projekt erzeugen
+        run: npx expo prebuild -p ios --no-install
+
+      - name: CocoaPods
+        working-directory: ios
+        run: pod install
+
+      - name: Bauen ohne Signatur
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -workspace ios/Werkstatt.xcworkspace \
+            -scheme Werkstatt \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            > build.log 2>&1 || { grep -E "error:|BUILD FAILED" build.log | head -40; tail -40 build.log; exit 1; }
+          tail -3 build.log
+
+      - name: IPA packen und Widget prüfen
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          echo "App: $APP"
+          ls "$APP/PlugIns" || { echo "::error::Widget-Erweiterung fehlt im App-Paket"; exit 1; }
+          mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/
+          (cd ipa && zip -qry ../Werkstatt-unsigniert.ipa Payload)
+          ls -lh Werkstatt-unsigniert.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Werkstatt-unsigniert
+          path: Werkstatt-unsigniert.ipa
+          retention-days: 14
+
+      - name: Bau-Protokoll bei Fehler
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
