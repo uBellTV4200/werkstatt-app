@@ -1,5 +1,8 @@
-# Baut die App auf einem Mac von GitHub, ohne Signatur. Ergebnis: Werkstatt-unsigniert.ipa als Download (Artifact).
+# Baut die App auf einem Mac von GitHub, ohne echte Signatur. Ergebnis: Werkstatt-unsigniert.ipa als Artifact und
+# als öffentlicher Download unter Releases → "neueste" (ohne Anmeldung ladbar, damit Claude sie selbst holen kann).
 # Signiert wird erst am Laptop (z. B. Sideloadly mit der Zweit-Apple-ID), deshalb braucht dieser Ablauf keine Schlüssel.
+# Die Platzhalter-Signatur (codesign -s -) bettet nur die Rechte ein, vor allem die App Group, die sich App und
+# Widget teilen. Sideloadly übernimmt beim Signieren die Rechte, die im Programm stehen.
 # Im Repo stehen nur Code und Einstellungen, keine Firmendaten und keine Zugangsdaten.
 name: iOS-Build (unsigniert)
 
@@ -26,6 +29,8 @@ jobs:
   ios:
     runs-on: ${{ inputs.runner || 'xcode-27' }}
     timeout-minutes: 75
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -65,11 +70,31 @@ jobs:
             > build.log 2>&1 || { grep -E "error:|BUILD FAILED" build.log | head -40; tail -40 build.log; exit 1; }
           tail -3 build.log
 
-      - name: IPA packen und Widget prüfen
+      - name: Rechte einbetten (Platzhalter-Signatur)
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          APPEX=$(find "$APP/PlugIns" -maxdepth 1 -name "*.appex" | head -1)
+          [ -n "$APPEX" ] || { echo "::error::Widget-Erweiterung fehlt im App-Paket"; exit 1; }
+          APP_RECHTE=$(find ios -name "*.entitlements" -not -path "*/Pods/*" | grep -vi widget | head -1)
+          WIDGET_RECHTE=$(find ios -name "*.entitlements" -not -path "*/Pods/*" | grep -i widget | head -1)
+          [ -n "$APP_RECHTE" ] && [ -n "$WIDGET_RECHTE" ] || { echo "::error::Rechte-Dateien nicht gefunden"; find ios -name "*.entitlements"; exit 1; }
+          echo "== App: $APP_RECHTE"; cat "$APP_RECHTE"
+          echo "== Widget: $WIDGET_RECHTE"; cat "$WIDGET_RECHTE"
+          # Von innen nach außen: erst eingebettete Frameworks, dann Widget, zuletzt die App
+          find "$APP" -depth \( -name "*.framework" -o -name "*.dylib" \) -not -path "*/PlugIns/*" -print0 \
+            | xargs -0 -n1 codesign --force --sign - --timestamp=none
+          codesign --force --sign - --timestamp=none --entitlements "$WIDGET_RECHTE" "$APPEX"
+          codesign --force --sign - --timestamp=none --entitlements "$APP_RECHTE" "$APP"
+          for B in "$APPEX" "$APP"; do
+            codesign -d --entitlements - --xml "$B" 2>/dev/null | grep -q "application-groups" \
+              || { echo "::error::App Group fehlt in $B"; exit 1; }
+          done
+          echo "App Group in App und Widget eingebettet"
+
+      - name: IPA packen
         run: |
           APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
           echo "App: $APP"
-          ls "$APP/PlugIns" || { echo "::error::Widget-Erweiterung fehlt im App-Paket"; exit 1; }
           mkdir -p ipa/Payload
           cp -R "$APP" ipa/Payload/
           (cd ipa && zip -qry ../Werkstatt-unsigniert.ipa Payload)
@@ -80,6 +105,16 @@ jobs:
           name: Werkstatt-unsigniert
           path: Werkstatt-unsigniert.ipa
           retention-days: 14
+
+      - name: Als Download "neueste" veröffentlichen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete neueste --yes --cleanup-tag || true
+          gh release create neueste Werkstatt-unsigniert.ipa \
+            --title "Neuester Build" \
+            --notes "Stand ${GITHUB_SHA::7}. Unsigniert, zum Aufspielen mit Sideloadly." \
+            --target "$GITHUB_SHA"
 
       - name: Bau-Protokoll bei Fehler
         if: failure()
